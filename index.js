@@ -36,6 +36,58 @@ async function hashSecret(text) {
     .join("");
 }
 
+function generateRecoveryCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid confusion
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  let code = "";
+  for (let i = 0; i < 8; i++) {
+    code += chars[bytes[i] % chars.length];
+  }
+  return code.slice(0, 4) + "-" + code.slice(4);
+}
+
+// ============ RATE LIMITING (brute-force protection) ============
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX_ATTEMPTS = 6;
+const RATE_LIMIT_BLOCK_MS = 15 * 60 * 1000; // 15 minutes
+
+function getClientIp(request) {
+  return request.headers.get("CF-Connecting-IP") || "unknown";
+}
+
+// Pure check — does NOT record anything. Call before doing the real work.
+async function isRateLimited(env, key) {
+  const row = await env.DB.prepare("SELECT blocked_until FROM rate_limits WHERE key = ?").bind(key).first();
+  if (row && row.blocked_until && new Date(row.blocked_until).getTime() > Date.now()) {
+    return true;
+  }
+  return false;
+}
+
+// Call after the real attempt completes, with whether it succeeded.
+async function recordAttemptResult(env, key, success) {
+  const now = Date.now();
+  if (success) {
+    await env.DB.prepare("DELETE FROM rate_limits WHERE key = ?").bind(key).run();
+    return;
+  }
+  const row = await env.DB.prepare("SELECT attempts, window_start FROM rate_limits WHERE key = ?").bind(key).first();
+  if (row && now - new Date(row.window_start).getTime() < RATE_LIMIT_WINDOW_MS) {
+    const attempts = row.attempts + 1;
+    const blockedUntil =
+      attempts >= RATE_LIMIT_MAX_ATTEMPTS ? new Date(now + RATE_LIMIT_BLOCK_MS).toISOString() : null;
+    await env.DB.prepare("UPDATE rate_limits SET attempts = ?, blocked_until = ? WHERE key = ?")
+      .bind(attempts, blockedUntil, key)
+      .run();
+  } else {
+    await env.DB.prepare(
+      "INSERT INTO rate_limits (key, attempts, window_start, blocked_until) VALUES (?, 1, ?, NULL) ON CONFLICT(key) DO UPDATE SET attempts = 1, window_start = excluded.window_start, blocked_until = NULL"
+    )
+      .bind(key, new Date(now).toISOString())
+      .run();
+  }
+}
+
 async function getSecondaryAdminHash(env) {
   const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'secondary_admin_password_hash'").first();
   return row ? row.value : null;
@@ -65,7 +117,45 @@ async function readJSON(request) {
   }
 }
 
+async function performBackup(env) {
+  const [courses, questions, users, comments, messages] = await Promise.all([
+    env.DB.prepare("SELECT id, title, icon, sort_order FROM courses ORDER BY sort_order").all(),
+    env.DB.prepare(
+      "SELECT id, course_id, question, options, answer, explanation, sort_order, gender FROM questions ORDER BY course_id, sort_order"
+    ).all(),
+    env.DB.prepare(
+      "SELECT id, name, points, correct_total, wrong_total, correct_today, wrong_today, day, created_at, updated_at, name_history FROM users"
+    ).all(),
+    env.DB.prepare("SELECT id, question_id, user_id, name, text, created_at FROM comments").all(),
+    env.DB.prepare("SELECT id, user_id, sender, text, created_at FROM messages").all(),
+  ]);
+  const snapshot = {
+    backup_date: new Date().toISOString(),
+    courses: courses.results,
+    questions: questions.results,
+    users: users.results,
+    comments: comments.results,
+    messages: messages.results,
+  };
+  const json_str = JSON.stringify(snapshot);
+  const key = "backup-" + new Date().toISOString();
+  await env.BACKUPS.put(key, json_str, { metadata: { size: json_str.length } });
+
+  // keep only the most recent 8 backups
+  const list = await env.BACKUPS.list({ prefix: "backup-" });
+  const keys = list.keys.map((k) => k.name).sort();
+  if (keys.length > 8) {
+    const toDelete = keys.slice(0, keys.length - 8);
+    await Promise.all(toDelete.map((k) => env.BACKUPS.delete(k)));
+  }
+  return key;
+}
+
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(performBackup(env));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -200,41 +290,87 @@ export default {
           return error("این نام قبلاً ثبت شده است.", 409);
         }
         const passwordHash = await hashSecret(password);
+        const recoveryCode = generateRecoveryCode();
+        const recoveryCodeHash = await hashSecret(recoveryCode);
         const now = new Date().toISOString();
         if (existingByName) {
           // legacy account with this name but no password yet -> claim it
-          await env.DB.prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
-            .bind(passwordHash, now, existingByName.id)
+          await env.DB.prepare("UPDATE users SET password_hash = ?, recovery_code_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(passwordHash, recoveryCodeHash, now, existingByName.id)
             .run();
-          return json({ ok: true, user_id: existingByName.id });
+          return json({ ok: true, user_id: existingByName.id, recovery_code: recoveryCode });
         }
         const existingById = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(id).first();
         if (existingById) {
-          await env.DB.prepare("UPDATE users SET name = ?, password_hash = ?, updated_at = ? WHERE id = ?")
-            .bind(name, passwordHash, now, id)
+          await env.DB.prepare("UPDATE users SET name = ?, password_hash = ?, recovery_code_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(name, passwordHash, recoveryCodeHash, now, id)
             .run();
         } else {
           await env.DB.prepare(
-            "INSERT INTO users (id, name, points, correct_total, wrong_total, correct_today, wrong_today, day, created_at, updated_at, name_history, password_hash) VALUES (?, ?, 0, 0, 0, 0, 0, ?, ?, ?, '[]', ?)"
+            "INSERT INTO users (id, name, points, correct_total, wrong_total, correct_today, wrong_today, day, created_at, updated_at, name_history, password_hash, recovery_code_hash) VALUES (?, ?, 0, 0, 0, 0, 0, ?, ?, ?, '[]', ?, ?)"
           )
-            .bind(id, name, todayKey(), now, now, passwordHash)
+            .bind(id, name, todayKey(), now, now, passwordHash, recoveryCodeHash)
             .run();
         }
-        return json({ ok: true, user_id: id });
+        return json({ ok: true, user_id: id, recovery_code: recoveryCode });
+      }
+
+      // POST /api/forgot-password  { name, recovery_code, new_password }
+      // Self-service password reset using the one-time recovery code shown at signup.
+      // Issues a fresh recovery code on success (the old one is single-use).
+      if (path === "/api/forgot-password" && method === "POST") {
+        const rlKey = "forgot:" + getClientIp(request);
+        if (await isRateLimited(env, rlKey)) {
+          return error("تلاش‌های زیاد. چند دقیقه دیگر دوباره امتحان کن.", 429);
+        }
+        const body = await readJSON(request);
+        const name = String(body.name || "").trim().slice(0, 60);
+        const recoveryCode = String(body.recovery_code || "").trim().toUpperCase();
+        const newPassword = String(body.new_password || "");
+        if (!name || !recoveryCode) return error("نام و کد بازیابی الزامی هستند");
+        if (newPassword.length < 6) return error("رمز جدید باید حداقل ۶ کاراکتر باشد");
+        const row = await env.DB.prepare("SELECT id, recovery_code_hash FROM users WHERE name = ?").bind(name).first();
+        if (!row || !row.recovery_code_hash) {
+          await recordAttemptResult(env, rlKey, false);
+          return error("نام یا کد بازیابی اشتباه است.", 404);
+        }
+        const codeHash = await hashSecret(recoveryCode);
+        if (codeHash !== row.recovery_code_hash) {
+          await recordAttemptResult(env, rlKey, false);
+          return error("نام یا کد بازیابی اشتباه است.", 401);
+        }
+        await recordAttemptResult(env, rlKey, true);
+        const newPasswordHash = await hashSecret(newPassword);
+        const newRecoveryCode = generateRecoveryCode();
+        const newRecoveryHash = await hashSecret(newRecoveryCode);
+        await env.DB.prepare("UPDATE users SET password_hash = ?, recovery_code_hash = ?, updated_at = ? WHERE id = ?")
+          .bind(newPasswordHash, newRecoveryHash, new Date().toISOString(), row.id)
+          .run();
+        return json({ ok: true, user_id: row.id, recovery_code: newRecoveryCode });
       }
 
       // POST /api/login  { name, password }
       // Logs into an existing account from any device.
       if (path === "/api/login" && method === "POST") {
+        const rlKey = "login:" + getClientIp(request);
+        if (await isRateLimited(env, rlKey)) {
+          return error("تلاش‌های زیاد. چند دقیقه دیگر دوباره امتحان کن.", 429);
+        }
         const body = await readJSON(request);
         const name = String(body.name || "").trim().slice(0, 60);
         const password = String(body.password || "");
         if (!name || !password) return error("نام و رمز عبور الزامی هستند");
         const row = await env.DB.prepare("SELECT id, password_hash FROM users WHERE name = ?").bind(name).first();
-        if (!row) return error("حسابی با این نام پیدا نشد.", 404);
-        if (!row.password_hash) return error("حسابی با این نام پیدا نشد.", 404);
+        if (!row || !row.password_hash) {
+          await recordAttemptResult(env, rlKey, false);
+          return error("حسابی با این نام پیدا نشد.", 404);
+        }
         const passwordHash = await hashSecret(password);
-        if (passwordHash !== row.password_hash) return error("رمز عبور اشتباه است.", 401);
+        if (passwordHash !== row.password_hash) {
+          await recordAttemptResult(env, rlKey, false);
+          return error("رمز عبور اشتباه است.", 401);
+        }
+        await recordAttemptResult(env, rlKey, true);
         return json({ ok: true, user_id: row.id });
       }
 
@@ -290,14 +426,18 @@ export default {
         return json({ ok: true });
       }
 
-      // POST /api/users/:id/answer  { correct: true/false }
+      // POST /api/users/:id/answer  { correct: true/false, question_id, course_id }
       m = path.match(/^\/api\/users\/([^/]+)\/answer$/);
       if (m && method === "POST") {
         const id = m[1];
         const body = await readJSON(request);
         const correct = !!body.correct;
+        const questionId = body.question_id ? String(body.question_id).slice(0, 100) : null;
+        const courseId = body.course_id ? String(body.course_id).slice(0, 100) : null;
         const now = new Date().toISOString();
-        const existing = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+        const USER_COLS =
+          "id, name, points, correct_total, wrong_total, correct_today, wrong_today, day, created_at, updated_at";
+        const existing = await env.DB.prepare(`SELECT ${USER_COLS} FROM users WHERE id = ?`).bind(id).first();
         if (!existing) {
           await env.DB.prepare(
             "INSERT INTO users (id, name, points, correct_total, wrong_total, correct_today, wrong_today, day, created_at, updated_at) VALUES (?, '', 0, 0, 0, 0, 0, ?, ?, ?)"
@@ -306,7 +446,7 @@ export default {
             .run();
         }
         // reset daily counters if day changed
-        const row = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+        const row = await env.DB.prepare(`SELECT ${USER_COLS} FROM users WHERE id = ?`).bind(id).first();
         let correctToday = row.day === todayKey() ? row.correct_today : 0;
         let wrongToday = row.day === todayKey() ? row.wrong_today : 0;
 
@@ -340,8 +480,27 @@ export default {
           )
           .run();
 
-        const updated = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first();
+        if (questionId && courseId) {
+          await env.DB.prepare(
+            "INSERT INTO answers (user_id, question_id, course_id, correct, created_at) VALUES (?, ?, ?, ?, ?)"
+          )
+            .bind(id, questionId, courseId, correct ? 1 : 0, now)
+            .run();
+        }
+
+        const updated = await env.DB.prepare(`SELECT ${USER_COLS} FROM users WHERE id = ?`).bind(id).first();
         return json(updated);
+      }
+
+      // GET /api/users/:id/progress -> distinct correctly-answered question ids, grouped by course
+      m = path.match(/^\/api\/users\/([^/]+)\/progress$/);
+      if (m && method === "GET") {
+        const { results } = await env.DB.prepare(
+          "SELECT DISTINCT question_id, course_id FROM answers WHERE user_id = ? AND correct = 1"
+        )
+          .bind(m[1])
+          .all();
+        return json(results);
       }
 
       // ============ PUBLIC: DIRECT MESSAGES (user <-> admin) ============
@@ -415,6 +574,36 @@ export default {
           if (adminRole !== "primary") return error("فقط ادمین اصلی اجازه دارد", 403);
           await env.DB.prepare("DELETE FROM settings WHERE key = 'secondary_admin_password_hash'").run();
           return json({ ok: true });
+        }
+
+        // ---- ADMIN: BACKUPS (primary only) ----
+        if (path === "/api/admin/backups" && method === "GET") {
+          if (adminRole !== "primary") return error("مسیر پیدا نشد", 404);
+          const list = await env.BACKUPS.list({ prefix: "backup-" });
+          const items = list.keys
+            .map((k) => ({
+              key: k.name,
+              created_at: k.name.replace("backup-", ""),
+              size: k.metadata && k.metadata.size ? k.metadata.size : null,
+            }))
+            .sort((a, b) => (a.key < b.key ? 1 : -1));
+          return json(items);
+        }
+
+        m = path.match(/^\/api\/admin\/backups\/(.+)$/);
+        if (m && method === "GET") {
+          if (adminRole !== "primary") return error("مسیر پیدا نشد", 404);
+          const data = await env.BACKUPS.get(decodeURIComponent(m[1]));
+          if (!data) return error("بکاپ پیدا نشد", 404);
+          return new Response(data, {
+            headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS },
+          });
+        }
+
+        if (path === "/api/admin/backups/run-now" && method === "POST") {
+          if (adminRole !== "primary") return error("مسیر پیدا نشد", 404);
+          const key = await performBackup(env);
+          return json({ ok: true, key });
         }
 
         // ---- ADMIN: COURSES ----
@@ -520,6 +709,24 @@ export default {
           return json({ ok: true });
         }
 
+        // ---- ADMIN: QUESTION STATS (most-missed questions) ----
+        if (path === "/api/admin/question-stats" && method === "GET") {
+          const { results } = await env.DB.prepare(
+            `SELECT
+               q.id as id,
+               q.course_id as course_id,
+               q.question as question,
+               COALESCE(SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END), 0) as correct_n,
+               COALESCE(SUM(CASE WHEN a.correct = 0 THEN 1 ELSE 0 END), 0) as wrong_n
+             FROM questions q
+             LEFT JOIN answers a ON a.question_id = q.id
+             GROUP BY q.id
+             HAVING (correct_n + wrong_n) > 0
+             ORDER BY (CAST(wrong_n AS REAL) / (correct_n + wrong_n)) DESC, wrong_n DESC`
+          ).all();
+          return json(results);
+        }
+
         // ---- ADMIN: COMMENTS ----
         if (path === "/api/admin/comments" && method === "GET") {
           const { results } = await env.DB.prepare(
@@ -575,6 +782,25 @@ export default {
           await env.DB.prepare("DELETE FROM messages WHERE user_id = ?").bind(m[1]).run();
           await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(m[1]).run();
           return json({ ok: true });
+        }
+
+        // POST /api/admin/users/:id/reset-password  { new_password }
+        // Manual last-resort reset when a user has lost both their password and recovery code.
+        m = path.match(/^\/api\/admin\/users\/([^/]+)\/reset-password$/);
+        if (m && method === "POST") {
+          if (adminRole !== "primary") return error("مسیر پیدا نشد", 404);
+          const b = await readJSON(request);
+          const newPassword = String(b.new_password || "");
+          if (newPassword.length < 6) return error("رمز باید حداقل ۶ کاراکتر باشد");
+          const existing = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(m[1]).first();
+          if (!existing) return error("کاربر پیدا نشد", 404);
+          const newPasswordHash = await hashSecret(newPassword);
+          const newRecoveryCode = generateRecoveryCode();
+          const newRecoveryHash = await hashSecret(newRecoveryCode);
+          await env.DB.prepare("UPDATE users SET password_hash = ?, recovery_code_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(newPasswordHash, newRecoveryHash, new Date().toISOString(), m[1])
+            .run();
+          return json({ ok: true, recovery_code: newRecoveryCode });
         }
 
         // ---- ADMIN: MESSAGES (primary admin only — hidden entirely from secondary) ----
