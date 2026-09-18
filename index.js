@@ -511,6 +511,65 @@ export default {
         return json(results);
       }
 
+      // ============ PUBLIC: REPORTS (question or user/comment reports) ============
+      // POST /api/reports  { type: 'question'|'user', target_id, target_label, reporter_user_id, reason }
+      if (path === "/api/reports" && method === "POST") {
+        const body = await readJSON(request);
+        const type = body.type === "user" ? "user" : "question";
+        const targetId = String(body.target_id || "").slice(0, 100);
+        if (!targetId) return error("target_id الزامی است");
+        const targetLabel = String(body.target_label || "").slice(0, 300);
+        const reason = String(body.reason || "").slice(0, 500);
+        const reporterUserId = body.reporter_user_id ? String(body.reporter_user_id).slice(0, 100) : null;
+        let reporterName = "";
+        if (reporterUserId) {
+          const u = await env.DB.prepare("SELECT name FROM users WHERE id = ?").bind(reporterUserId).first();
+          reporterName = u && u.name ? u.name : "";
+        }
+        const now = new Date().toISOString();
+        await env.DB.prepare(
+          "INSERT INTO reports (type, target_id, target_label, reporter_user_id, reporter_name, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+          .bind(type, targetId, targetLabel, reporterUserId, reporterName, reason, now)
+          .run();
+        return json({ ok: true });
+      }
+
+      // ============ PUBLIC: BOOKMARKS (per-user flagged questions) ============
+      // GET /api/users/:id/bookmarks
+      let bm = path.match(/^\/api\/users\/([^/]+)\/bookmarks$/);
+      if (bm && method === "GET") {
+        const { results } = await env.DB.prepare(
+          "SELECT question_id, course_id FROM bookmarks WHERE user_id = ? ORDER BY created_at DESC"
+        )
+          .bind(bm[1])
+          .all();
+        return json(results);
+      }
+
+      // POST /api/users/:id/bookmarks  { question_id, course_id }
+      if (bm && method === "POST") {
+        const body = await readJSON(request);
+        const questionId = String(body.question_id || "").slice(0, 100);
+        const courseId = String(body.course_id || "").slice(0, 100);
+        if (!questionId) return error("question_id الزامی است");
+        await env.DB.prepare(
+          "INSERT INTO bookmarks (user_id, question_id, course_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, question_id) DO NOTHING"
+        )
+          .bind(bm[1], questionId, courseId, new Date().toISOString())
+          .run();
+        return json({ ok: true });
+      }
+
+      // DELETE /api/users/:id/bookmarks/:questionId
+      bm = path.match(/^\/api\/users\/([^/]+)\/bookmarks\/([^/]+)$/);
+      if (bm && method === "DELETE") {
+        await env.DB.prepare("DELETE FROM bookmarks WHERE user_id = ? AND question_id = ?")
+          .bind(bm[1], bm[2])
+          .run();
+        return json({ ok: true });
+      }
+
       // ============ PUBLIC: DIRECT MESSAGES (user <-> admin) ============
       // GET /api/messages?user_id=ID
       if (path === "/api/messages" && method === "GET") {
@@ -714,6 +773,20 @@ export default {
 
         if (m && method === "DELETE") {
           await env.DB.prepare("DELETE FROM questions WHERE id = ?").bind(m[1]).run();
+          return json({ ok: true });
+        }
+
+        // ---- ADMIN: REPORTS (question/user reports — shared by both admin roles) ----
+        if (path === "/api/admin/reports" && method === "GET") {
+          const { results } = await env.DB.prepare(
+            "SELECT * FROM reports ORDER BY id DESC LIMIT 300"
+          ).all();
+          return json(results);
+        }
+
+        m = path.match(/^\/api\/admin\/reports\/(\d+)$/);
+        if (m && method === "DELETE") {
+          await env.DB.prepare("DELETE FROM reports WHERE id = ?").bind(m[1]).run();
           return json({ ok: true });
         }
 
