@@ -753,7 +753,44 @@ export default {
           return json({ ok: true });
         }
 
-        m = path.match(/^\/api\/admin\/questions\/([^/]+)$/);
+        // POST /api/admin/questions/bulk  { course_id, questions: [{question, options, answer, explanation, gender}] }
+        if (path === "/api/admin/questions/bulk" && method === "POST") {
+          const b = await readJSON(request);
+          const courseId = String(b.course_id || "");
+          const list = Array.isArray(b.questions) ? b.questions : [];
+          if (!courseId) return error("course_id الزامی است");
+          if (!list.length) return error("حداقل یک سوال لازم است");
+          for (const q of list) {
+            if (!q.question || !Array.isArray(q.options) || q.options.length < 2) {
+              return error("هر سوال باید question و حداقل ۲ گزینه داشته باشد");
+            }
+          }
+          const maxRow = await env.DB.prepare(
+            "SELECT COALESCE(MAX(sort_order), -1) as m FROM questions WHERE course_id = ?"
+          )
+            .bind(courseId)
+            .first();
+          let nextSort = maxRow.m + 1;
+          const now = Date.now().toString(36);
+          const statements = list.map((q, i) => {
+            const id = "q_" + now + "_" + i + "_" + Math.random().toString(36).slice(2, 6);
+            const stmt = env.DB.prepare(
+              "INSERT INTO questions (id, course_id, question, options, answer, explanation, sort_order, gender) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ).bind(
+              id,
+              courseId,
+              String(q.question),
+              JSON.stringify(q.options),
+              Number(q.answer) || 0,
+              q.explanation || null,
+              nextSort++,
+              q.gender || null
+            );
+            return stmt;
+          });
+          await env.DB.batch(statements);
+          return json({ ok: true, count: statements.length });
+        }
         if (m && method === "PUT") {
           const b = await readJSON(request);
           await env.DB.prepare(
