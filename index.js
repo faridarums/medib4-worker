@@ -278,6 +278,10 @@ export default {
       // POST /api/register  { id, name, password }
       // Creates a brand-new account. Fails if the name is already taken (with a password).
       if (path === "/api/register" && method === "POST") {
+        const rlKey = "register:" + getClientIp(request);
+        if (await isRateLimited(env, rlKey)) {
+          return error("تلاش‌های زیاد. چند دقیقه دیگر دوباره امتحان کن.", 429);
+        }
         const body = await readJSON(request);
         const id = String(body.id || "").slice(0, 100);
         const name = String(body.name || "").trim().slice(0, 60);
@@ -287,8 +291,10 @@ export default {
         }
         const existingByName = await env.DB.prepare("SELECT id, password_hash FROM users WHERE name = ?").bind(name).first();
         if (existingByName && existingByName.password_hash) {
+          await recordAttemptResult(env, rlKey, false);
           return error("این نام قبلاً ثبت شده است.", 409);
         }
+        await recordAttemptResult(env, rlKey, true);
         const passwordHash = await hashSecret(password);
         const recoveryCode = generateRecoveryCode();
         const recoveryCodeHash = await hashSecret(recoveryCode);
@@ -599,11 +605,17 @@ export default {
 
       // ============ ADMIN: LOGIN CHECK ============
       if (path === "/api/admin/login" && method === "POST") {
+        const rlKey = "adminlogin:" + getClientIp(request);
+        if (await isRateLimited(env, rlKey)) {
+          return error("تلاش‌های زیاد. چند دقیقه دیگر دوباره امتحان کن.", 429);
+        }
         const body = await readJSON(request);
         const auth = await checkAdminAuth(body.password || "", env);
         if (auth.ok) {
+          await recordAttemptResult(env, rlKey, true);
           return json({ ok: true, role: auth.role });
         }
+        await recordAttemptResult(env, rlKey, false);
         return error("رمز عبور اشتباه است", 401);
       }
 
@@ -625,7 +637,7 @@ export default {
         if (path === "/api/admin/settings/secondary-admin" && method === "POST") {
           if (adminRole !== "primary") return error("فقط ادمین اصلی اجازه دارد", 403);
           const b = await readJSON(request);
-          if (!b.password || String(b.password).length < 4) {
+          if (!b.password || String(b.password).length < 6) {
             return error("رمز باید حداقل ۶ کاراکتر باشد");
           }
           const hash = await hashSecret(String(b.password));
@@ -791,6 +803,8 @@ export default {
           await env.DB.batch(statements);
           return json({ ok: true, count: statements.length });
         }
+
+        m = path.match(/^\/api\/admin\/questions\/([^/]+)$/);
         if (m && method === "PUT") {
           const b = await readJSON(request);
           await env.DB.prepare(
