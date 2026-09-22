@@ -11,9 +11,12 @@ database_id = "48fc81ee-682f-4730-adef-2bfd9cfa6a4a"
 binding = "BACKUPS"
 id = "6bc3f593f0cc4ed4a281182477cb06d8"
 
-# Runs every Sunday at 03:00 UTC and stores a full JSON backup in the BACKUPS KV namespace
-[triggers]
-crons = ["0 3 * * 0"]
+# Automatic weekly backup (cron) was removed here because this account's
+# Cloudflare plan/deploy pipeline rejected the schedule. You can still take
+# a backup anytime from the admin panel's "گرفتن بکاپ همین الان" button,
+# or add a Cron Trigger manually from the dashboard:
+# Worker page -> Settings -> Triggers -> Cron Triggers -> Add Cron Trigger
+# (try schedule: 0 3 * * SUN)
 
 # Admin password must be set as a secret, NOT here:
 #   wrangler secret put ADMIN_PASSWORD
