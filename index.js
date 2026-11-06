@@ -505,10 +505,15 @@ export default {
 
         // امتیاز هر سوال فقط یک‌بار برای هر کاربر ثبت می‌شود؛ حتی اگر کاربر
         // با برگشت به سوال دوباره پاسخ بدهد یا localStorage پاک/ناسازگار باشد.
-        if (questionId) {
+        // Question IDs are not guaranteed to be globally unique: different
+        // courses can contain a question with the same numeric/string ID.
+        // Scope the duplicate check to the account AND course AND question.
+        // Otherwise a first-time answer in course B is incorrectly rejected
+        // because the same question_id was answered earlier in course A.
+        if (questionId && courseId) {
           const alreadyAnswered = await env.DB.prepare(
-            "SELECT id FROM answers WHERE user_id = ? AND question_id = ? LIMIT 1"
-          ).bind(id, questionId).first();
+            "SELECT id FROM answers WHERE user_id = ? AND course_id = ? AND question_id = ? LIMIT 1"
+          ).bind(id, courseId, questionId).first();
           if (alreadyAnswered) {
             return json({ ...row, already_answered: true });
           }
