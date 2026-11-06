@@ -117,8 +117,38 @@ async function readJSON(request) {
   }
 }
 
+async function ensureFeatureTables(env) {
+  await env.DB.batch([
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS admin_activity (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      role TEXT NOT NULL,
+      action TEXT NOT NULL,
+      details TEXT,
+      created_at TEXT NOT NULL
+    )`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS announcements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      course_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      text TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`)
+  ]);
+}
+
+async function logAdminActivity(env, role, action, details = "") {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO admin_activity (role, action, details, created_at) VALUES (?, ?, ?, ?)"
+    ).bind(role, action, String(details || "").slice(0, 1000), new Date().toISOString()).run();
+  } catch (e) {
+    // Logging must never make an otherwise successful admin operation fail.
+  }
+}
+
 async function performBackup(env) {
-  const [courses, questions, users, comments, messages] = await Promise.all([
+  const [courses, questions, users, comments, messages, announcements, adminActivity] = await Promise.all([
     env.DB.prepare("SELECT id, title, icon, sort_order FROM courses ORDER BY sort_order").all(),
     env.DB.prepare(
       "SELECT id, course_id, question, options, answer, explanation, sort_order, gender FROM questions ORDER BY course_id, sort_order"
@@ -128,6 +158,8 @@ async function performBackup(env) {
     ).all(),
     env.DB.prepare("SELECT id, question_id, user_id, name, text, created_at FROM comments").all(),
     env.DB.prepare("SELECT id, user_id, sender, text, created_at FROM messages").all(),
+    env.DB.prepare("SELECT id, course_id, title, text, created_at, updated_at FROM announcements").all(),
+    env.DB.prepare("SELECT id, role, action, details, created_at FROM admin_activity ORDER BY id").all(),
   ]);
   const snapshot = {
     backup_date: new Date().toISOString(),
@@ -136,6 +168,8 @@ async function performBackup(env) {
     users: users.results,
     comments: comments.results,
     messages: messages.results,
+    announcements: announcements.results,
+    admin_activity: adminActivity.results,
   };
   const json_str = JSON.stringify(snapshot);
   const key = "backup-" + new Date().toISOString();
@@ -166,11 +200,23 @@ export default {
     }
 
     try {
+      await ensureFeatureTables(env);
       // ============ PUBLIC: COURSES ============
       if (path === "/api/courses" && method === "GET") {
         const { results } = await env.DB.prepare(
           "SELECT id, title, icon FROM courses ORDER BY sort_order ASC"
         ).all();
+        return json(results);
+      }
+
+      // ============ PUBLIC: ANNOUNCEMENTS ============
+      // GET /api/announcements?course=ID -> active notices for one course
+      if (path === "/api/announcements" && method === "GET") {
+        const courseId = url.searchParams.get("course");
+        if (!courseId) return error("course الزامی است");
+        const { results } = await env.DB.prepare(
+          "SELECT id, course_id, title, text, created_at, updated_at FROM announcements WHERE course_id = ? ORDER BY id DESC"
+        ).bind(courseId).all();
         return json(results);
       }
 
@@ -453,6 +499,18 @@ export default {
         }
         // reset daily counters if day changed
         const row = await env.DB.prepare(`SELECT ${USER_COLS} FROM users WHERE id = ?`).bind(id).first();
+
+        // امتیاز هر سوال فقط یک‌بار برای هر کاربر ثبت می‌شود؛ حتی اگر کاربر
+        // با برگشت به سوال دوباره پاسخ بدهد یا localStorage پاک/ناسازگار باشد.
+        if (questionId) {
+          const alreadyAnswered = await env.DB.prepare(
+            "SELECT id FROM answers WHERE user_id = ? AND question_id = ? LIMIT 1"
+          ).bind(id, questionId).first();
+          if (alreadyAnswered) {
+            return json({ ...row, already_answered: true });
+          }
+        }
+
         let correctToday = row.day === todayKey() ? row.correct_today : 0;
         let wrongToday = row.day === todayKey() ? row.wrong_today : 0;
 
@@ -704,6 +762,7 @@ export default {
           )
             .bind(b.id, b.title, b.icon || "book-open", maxRow.m + 1)
             .run();
+          await logAdminActivity(env, adminRole, "افزودن درس", `درس «${b.title}» ایجاد شد.`);
           return json({ ok: true });
         }
 
@@ -713,12 +772,16 @@ export default {
           await env.DB.prepare("UPDATE courses SET title = ?, icon = ? WHERE id = ?")
             .bind(b.title, b.icon || "book-open", m[1])
             .run();
+          await logAdminActivity(env, adminRole, "ویرایش درس", `درس ${m[1]} به «${b.title}» تغییر کرد.`);
           return json({ ok: true });
         }
 
         if (m && method === "DELETE") {
+          const qCount = await env.DB.prepare("SELECT COUNT(*) as count FROM questions WHERE course_id = ?").bind(m[1]).first();
           await env.DB.prepare("DELETE FROM questions WHERE course_id = ?").bind(m[1]).run();
+          await env.DB.prepare("DELETE FROM announcements WHERE course_id = ?").bind(m[1]).run();
           await env.DB.prepare("DELETE FROM courses WHERE id = ?").bind(m[1]).run();
+          await logAdminActivity(env, adminRole, "حذف درس", `درس ${m[1]} و ${qCount?.count || 0} سوال آن حذف شد.`);
           return json({ ok: true });
         }
 
@@ -762,6 +825,7 @@ export default {
               b.gender || null
             )
             .run();
+          await logAdminActivity(env, adminRole, "افزودن سوال", `سوال جدید به درس ${b.course_id} اضافه شد.`);
           return json({ ok: true });
         }
 
@@ -801,7 +865,17 @@ export default {
             return stmt;
           });
           await env.DB.batch(statements);
+          await logAdminActivity(env, adminRole, "افزودن دسته‌جمعی سوالات", `${statements.length} سوال به درس ${courseId} اضافه شد.`);
           return json({ ok: true, count: statements.length });
+        }
+
+        m = path.match(/^\/api\/admin\/questions\/by-course\/([^/]+)$/);
+        if (m && method === "DELETE") {
+          const courseId = decodeURIComponent(m[1]);
+          const countRow = await env.DB.prepare("SELECT COUNT(*) as count FROM questions WHERE course_id = ?").bind(courseId).first();
+          await env.DB.prepare("DELETE FROM questions WHERE course_id = ?").bind(courseId).run();
+          await logAdminActivity(env, adminRole, "حذف همه سوالات", `تمام ${countRow?.count || 0} سوال درس ${courseId} حذف شد.`);
+          return json({ ok: true, deleted: Number(countRow?.count || 0) });
         }
 
         m = path.match(/^\/api\/admin\/questions\/([^/]+)$/);
@@ -819,12 +893,51 @@ export default {
               m[1]
             )
             .run();
+          await logAdminActivity(env, adminRole, "ویرایش سوال", `سوال ${m[1]} ویرایش شد.`);
           return json({ ok: true });
         }
 
         if (m && method === "DELETE") {
           await env.DB.prepare("DELETE FROM questions WHERE id = ?").bind(m[1]).run();
+          await logAdminActivity(env, adminRole, "حذف سوال", `سوال ${m[1]} حذف شد.`);
           return json({ ok: true });
+        }
+
+        // ---- ADMIN: ANNOUNCEMENTS ----
+        if (path === "/api/admin/announcements" && method === "GET") {
+          const { results } = await env.DB.prepare(
+            `SELECT a.*, c.title as course_title FROM announcements a LEFT JOIN courses c ON c.id = a.course_id ORDER BY a.id DESC`
+          ).all();
+          return json(results);
+        }
+
+        if (path === "/api/admin/announcements" && method === "POST") {
+          const b = await readJSON(request);
+          const courseId = String(b.course_id || "").slice(0, 100);
+          const title = String(b.title || "").trim().slice(0, 200);
+          const text = String(b.text || "").trim().slice(0, 5000);
+          if (!courseId || !title || !text) return error("course_id، عنوان و متن الزامی هستند");
+          const now = new Date().toISOString();
+          await env.DB.prepare(
+            "INSERT INTO announcements (course_id, title, text, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
+          ).bind(courseId, title, text, now, now).run();
+          await logAdminActivity(env, adminRole, "انتشار اطلاعیه", `اطلاعیه «${title}» برای درس ${courseId} منتشر شد.`);
+          return json({ ok: true });
+        }
+
+        m = path.match(/^\/api\/admin\/announcements\/(\d+)$/);
+        if (m && method === "DELETE") {
+          await env.DB.prepare("DELETE FROM announcements WHERE id = ?").bind(m[1]).run();
+          await logAdminActivity(env, adminRole, "حذف اطلاعیه", `اطلاعیه ${m[1]} حذف شد.`);
+          return json({ ok: true });
+        }
+
+        // ---- ADMIN: ACTIVITY LOG ----
+        if (path === "/api/admin/activity" && method === "GET") {
+          const { results } = await env.DB.prepare(
+            "SELECT id, role, action, details, created_at FROM admin_activity ORDER BY id DESC LIMIT 300"
+          ).all();
+          return json(results);
         }
 
         // ---- ADMIN: REPORTS (question/user reports — shared by both admin roles) ----
@@ -838,6 +951,7 @@ export default {
         m = path.match(/^\/api\/admin\/reports\/(\d+)$/);
         if (m && method === "DELETE") {
           await env.DB.prepare("DELETE FROM reports WHERE id = ?").bind(m[1]).run();
+          await logAdminActivity(env, adminRole, "حذف گزارش", `گزارش ${m[1]} حذف شد.`);
           return json({ ok: true });
         }
 
@@ -870,6 +984,7 @@ export default {
         m = path.match(/^\/api\/admin\/comments\/(\d+)$/);
         if (m && method === "DELETE") {
           await env.DB.prepare("DELETE FROM comments WHERE id = ?").bind(m[1]).run();
+          await logAdminActivity(env, adminRole, "حذف نظر", `نظر ${m[1]} حذف شد.`);
           return json({ ok: true });
         }
 
@@ -902,6 +1017,7 @@ export default {
           )
             .bind(newName, Number(b.points) || 0, m[1])
             .run();
+          await logAdminActivity(env, adminRole, "ویرایش کاربر", `کاربر ${m[1]} ویرایش شد.`);
           return json({ ok: true });
         }
 
@@ -909,6 +1025,7 @@ export default {
           await env.DB.prepare("DELETE FROM comments WHERE user_id = ?").bind(m[1]).run();
           await env.DB.prepare("DELETE FROM messages WHERE user_id = ?").bind(m[1]).run();
           await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(m[1]).run();
+          await logAdminActivity(env, adminRole, "حذف کاربر", `کاربر ${m[1]} حذف شد.`);
           return json({ ok: true });
         }
 
@@ -927,6 +1044,7 @@ export default {
           await env.DB.prepare("UPDATE users SET password_hash = ?, recovery_code_hash = ?, updated_at = ? WHERE id = ?")
             .bind(newPasswordHash, newRecoveryHash, new Date().toISOString(), m[1])
             .run();
+          await logAdminActivity(env, adminRole, "بازنشانی رمز کاربر", `رمز کاربر ${m[1]} بازنشانی شد.`);
           return json({ ok: true, recovery_code: newRecoveryCode });
         }
 
@@ -972,6 +1090,7 @@ export default {
           )
             .bind(b.user_id, text, now)
             .run();
+          await logAdminActivity(env, adminRole, "ارسال پیام", `پیامی برای کاربر ${b.user_id} ارسال شد.`);
           return json({ ok: true });
         }
 
