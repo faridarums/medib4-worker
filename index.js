@@ -213,10 +213,13 @@ export default {
       // GET /api/announcements?course=ID -> active notices for one course
       if (path === "/api/announcements" && method === "GET") {
         const courseId = url.searchParams.get("course");
-        if (!courseId) return error("course الزامی است");
-        const { results } = await env.DB.prepare(
-          "SELECT id, course_id, title, text, created_at, updated_at FROM announcements WHERE course_id = ? ORDER BY id DESC"
-        ).bind(courseId).all();
+        const { results } = courseId
+          ? await env.DB.prepare(
+              "SELECT id, course_id, title, text, created_at, updated_at FROM announcements WHERE course_id = ? ORDER BY id DESC"
+            ).bind(courseId).all()
+          : await env.DB.prepare(
+              "SELECT id, course_id, title, text, created_at, updated_at FROM announcements WHERE course_id = '__global__' ORDER BY id DESC"
+            ).all();
         return json(results);
       }
 
@@ -932,8 +935,9 @@ export default {
           return json({ ok: true });
         }
 
-        // ---- ADMIN: ACTIVITY LOG ----
+        // ---- ADMIN: ACTIVITY LOG (PRIMARY ADMIN ONLY) ----
         if (path === "/api/admin/activity" && method === "GET") {
+          if (adminRole !== "primary") return error("فقط ادمین اصلی اجازه مشاهده فعالیت‌های ادمین را دارد", 403);
           const { results } = await env.DB.prepare(
             "SELECT id, role, action, details, created_at FROM admin_activity ORDER BY id DESC LIMIT 300"
           ).all();
