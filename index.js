@@ -244,6 +244,10 @@ async function ensureFeatureTables(env) {
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS webauthn_credentials (
       credential_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, x TEXT NOT NULL, y TEXT NOT NULL, alg INTEGER NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     )`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS telegram_biometric_tokens (
+      device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, token_hash TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_telegram_biometric_user ON telegram_biometric_tokens(user_id)`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS comment_replies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       comment_id INTEGER NOT NULL,
@@ -562,6 +566,65 @@ export default {
         return json({ ok: true, user_id: row.id });
       }
 
+
+      // ============ PUBLIC: TELEGRAM NATIVE BIOMETRIC LOGIN ============
+      // Telegram stores the opaque token in its bot-scoped secure storage. The Worker stores only its hash.
+      if (path === "/api/telegram-biometric/enroll" && method === "POST") {
+        const rlKey = "tg-bio-enroll:" + getClientIp(request);
+        if (await isRateLimited(env, rlKey)) return error("تلاش‌های زیاد. چند دقیقه دیگر دوباره امتحان کن.", 429);
+        const body = await readJSON(request);
+        const userId = String(body.user_id || "").slice(0, 100);
+        const password = String(body.password || "");
+        const deviceId = String(body.device_id || "").slice(0, 200);
+        const token = String(body.token || "");
+        if (!userId || !password || !deviceId || token.length < 32 || token.length > 128) return error("اطلاعات فعال‌سازی بیومتریک ناقص است.", 400);
+        const user = await env.DB.prepare("SELECT id, password_hash FROM users WHERE id = ?").bind(userId).first();
+        if (!user || !user.password_hash || await hashSecret(password) !== user.password_hash) {
+          await recordAttemptResult(env, rlKey, false);
+          return error("برای فعال‌سازی ورود تلگرام، رمز حساب را دوباره بررسی کن.", 401);
+        }
+        await recordAttemptResult(env, rlKey, true);
+        const tokenHash = await hashSecret(token), now = new Date().toISOString();
+        await env.DB.prepare(`INSERT INTO telegram_biometric_tokens (device_id,user_id,token_hash,created_at,updated_at)
+          VALUES (?,?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET user_id=excluded.user_id, token_hash=excluded.token_hash, updated_at=excluded.updated_at`)
+          .bind(deviceId,userId,tokenHash,now,now).run();
+        return json({ok:true});
+      }
+      if (path === "/api/telegram-biometric/login" && method === "POST") {
+        const body = await readJSON(request);
+        const deviceId = String(body.device_id || "").slice(0, 200);
+        const token = String(body.token || "");
+        if (!deviceId || token.length < 32 || token.length > 128) return error("کلید بیومتریک نامعتبر است.", 400);
+        const rlKey = "tg-bio-login:" + getClientIp(request) + ":" + deviceId.slice(0,80);
+        if (await isRateLimited(env, rlKey)) return error("تلاش‌های زیاد. چند دقیقه دیگر دوباره امتحان کن.", 429);
+        const tokenHash = await hashSecret(token);
+        const record = await env.DB.prepare("SELECT user_id FROM telegram_biometric_tokens WHERE device_id = ? AND token_hash = ?").bind(deviceId,tokenHash).first();
+        if (!record) { await recordAttemptResult(env, rlKey, false); return error("این کلید بیومتریک معتبر نیست؛ با رمز وارد شو و دوباره فعالش کن.", 401); }
+        const user = await env.DB.prepare("SELECT name FROM users WHERE id = ?").bind(record.user_id).first();
+        if (!user) { await env.DB.prepare("DELETE FROM telegram_biometric_tokens WHERE device_id = ?").bind(deviceId).run(); await recordAttemptResult(env, rlKey, false); return error("حساب متصل به این کلید پیدا نشد.", 404); }
+        await recordAttemptResult(env, rlKey, true);
+        await env.DB.prepare("UPDATE telegram_biometric_tokens SET updated_at = ? WHERE device_id = ?").bind(new Date().toISOString(),deviceId).run();
+        return json({ok:true,user_id:record.user_id,name:user.name || ""});
+      }
+      if (path === "/api/telegram-biometric/revoke" && method === "POST") {
+        const body = await readJSON(request);
+        const deviceId = String(body.device_id || "").slice(0, 200);
+        const token = String(body.token || "");
+        const userId = String(body.user_id || "").slice(0, 100);
+        const password = String(body.password || "");
+        if (!deviceId) return error("شناسه دستگاه الزامی است.", 400);
+        const record = await env.DB.prepare("SELECT user_id,token_hash FROM telegram_biometric_tokens WHERE device_id = ?").bind(deviceId).first();
+        if (!record) return json({ok:true});
+        let authorized = false;
+        if (token && token.length >= 32) authorized = (await hashSecret(token)) === record.token_hash;
+        if (!authorized && userId && password && userId === record.user_id) {
+          const user = await env.DB.prepare("SELECT password_hash FROM users WHERE id = ?").bind(userId).first();
+          authorized = !!(user && user.password_hash && await hashSecret(password) === user.password_hash);
+        }
+        if (!authorized) return error("برای حذف کلید بیومتریک، تأیید هویت لازم است.", 401);
+        await env.DB.prepare("DELETE FROM telegram_biometric_tokens WHERE device_id = ? AND user_id = ?").bind(deviceId,record.user_id).run();
+        return json({ok:true});
+      }
 
       // ============ PUBLIC: WEBAUTHN / PASSKEY ==========
       if (path === "/api/webauthn/register/options" && method === "POST") {
