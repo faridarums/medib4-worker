@@ -243,7 +243,15 @@ async function ensureFeatureTables(env) {
     )`),
     env.DB.prepare(`CREATE TABLE IF NOT EXISTS webauthn_credentials (
       credential_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, x TEXT NOT NULL, y TEXT NOT NULL, alg INTEGER NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
-    )`)
+    )`),
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS comment_replies (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      comment_id INTEGER NOT NULL,
+      text TEXT NOT NULL,
+      admin_role TEXT NOT NULL DEFAULT 'primary',
+      created_at TEXT NOT NULL
+    )`),
+    env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_comment_replies_comment_id ON comment_replies(comment_id, id)`)
   ]);
   try { await env.DB.prepare("ALTER TABLE webauthn_challenges ADD COLUMN origin TEXT").run(); } catch {}
 }
@@ -363,6 +371,19 @@ export default {
         )
           .bind(questionId)
           .all();
+        if (results.length) {
+          const ids = results.map(c => c.id);
+          const marks = ids.map(() => "?").join(",");
+          const replyRows = await env.DB.prepare(
+            `SELECT id, comment_id, text, admin_role, created_at FROM comment_replies WHERE comment_id IN (${marks}) ORDER BY id ASC`
+          ).bind(...ids).all();
+          const byComment = new Map();
+          for (const r of replyRows.results) {
+            if (!byComment.has(r.comment_id)) byComment.set(r.comment_id, []);
+            byComment.get(r.comment_id).push(r);
+          }
+          for (const c of results) c.replies = byComment.get(c.id) || [];
+        }
         return json(results);
       }
 
@@ -399,6 +420,7 @@ export default {
         const row = await env.DB.prepare("SELECT user_id FROM comments WHERE id = ?").bind(m[1]).first();
         if (!row) return error("نظر پیدا نشد", 404);
         if (!userId || row.user_id !== userId) return error("اجازه حذف این نظر را ندارید", 403);
+        await env.DB.prepare("DELETE FROM comment_replies WHERE comment_id = ?").bind(m[1]).run();
         await env.DB.prepare("DELETE FROM comments WHERE id = ?").bind(m[1]).run();
         return json({ ok: true });
       }
@@ -549,6 +571,7 @@ export default {
         const origin = String(body.origin || "");
         if (!origin) return error("origin الزامی است.", 400);
         let rpId; try { rpId = expectedRpIdFromOrigin(origin); } catch { return error("origin نامعتبر است.", 400); }
+        if (request.headers.get("Origin") && request.headers.get("Origin") !== origin) return error("مبدأ درخواست با صفحهٔ برنامه یکسان نیست.", 403);
         const row = await env.DB.prepare("SELECT id, name, password_hash FROM users WHERE id = ?").bind(userId).first();
         if (!row || !row.password_hash || (await hashSecret(password)) !== row.password_hash) return error("احراز هویت ناموفق است.", 401);
         const challenge = b64uEncode(crypto.getRandomValues(new Uint8Array(32)));
@@ -566,6 +589,7 @@ export default {
         if (!ch) return error("درخواست ثبت Passkey منقضی شده است.",400);
         if (cd.type!=="webauthn.create" || cd.origin!==ch.origin) return error("ثبت Passkey نامعتبر است.",400);
         const parsed=parseAttestationObject(b64uDecode(c.response.attestationObject));
+        if (parsed.credentialId !== String(c.id)) return error("شناسهٔ Passkey با اطلاعات ثبت‌شده مطابقت ندارد.",400);
         await env.DB.prepare("INSERT OR REPLACE INTO webauthn_credentials (credential_id,user_id,x,y,alg,sign_count,created_at) VALUES (?,?,?,?,?,?,?)").bind(parsed.credentialId,userId,parsed.x,parsed.y,parsed.alg,0,new Date().toISOString()).run();
         await env.DB.prepare("DELETE FROM webauthn_challenges WHERE id=?").bind(ch.id).run();
         return json({ok:true,credential_id:parsed.credentialId});
@@ -575,6 +599,7 @@ export default {
         const origin = String(body.origin || "");
         if (!origin) return error("origin الزامی است.",400);
         let rpId; try { rpId=expectedRpIdFromOrigin(origin); } catch { return error("origin نامعتبر است.",400); }
+        if (request.headers.get("Origin") && request.headers.get("Origin") !== origin) return error("مبدأ درخواست با صفحهٔ برنامه یکسان نیست.",403);
         const challenge=b64uEncode(crypto.getRandomValues(new Uint8Array(32))), expires=new Date(Date.now()+120000).toISOString();
         await env.DB.prepare("DELETE FROM webauthn_challenges WHERE expires_at < ?").bind(new Date().toISOString()).run();
         await env.DB.prepare("INSERT INTO webauthn_challenges (challenge,user_id,type,origin,expires_at) VALUES (?,?,?,?,?)").bind(challenge,null,"login",origin,expires).run();
@@ -594,7 +619,8 @@ export default {
           const newCount=await verifyPasskeySignature(cred,c.response.authenticatorData,c.response.clientDataJSON,c.response.signature,ch.origin);
           await env.DB.prepare("UPDATE webauthn_credentials SET sign_count=? WHERE credential_id=?").bind(newCount,String(c.id)).run();
           await env.DB.prepare("DELETE FROM webauthn_challenges WHERE id=?").bind(ch.id).run();
-          return json({ok:true,user_id:cred.user_id});
+          const user = await env.DB.prepare("SELECT name FROM users WHERE id = ?").bind(cred.user_id).first();
+          return json({ok:true,user_id:cred.user_id,name:user?.name || ""});
         } catch(e) { return error("تأیید Passkey ناموفق بود.",401); }
       }
 
@@ -1156,11 +1182,40 @@ export default {
           const { results } = await env.DB.prepare(
             "SELECT * FROM comments ORDER BY id DESC LIMIT 300"
           ).all();
+          if (results.length) {
+            const ids = results.map(c => c.id);
+            const marks = ids.map(() => "?").join(",");
+            const replyRows = await env.DB.prepare(
+              `SELECT id, comment_id, text, admin_role, created_at FROM comment_replies WHERE comment_id IN (${marks}) ORDER BY id ASC`
+            ).bind(...ids).all();
+            const byComment = new Map();
+            for (const r of replyRows.results) {
+              if (!byComment.has(r.comment_id)) byComment.set(r.comment_id, []);
+              byComment.get(r.comment_id).push(r);
+            }
+            for (const c of results) c.replies = byComment.get(c.id) || [];
+          }
           return json(results);
+        }
+
+        m = path.match(/^\/api\/admin\/comments\/(\d+)\/replies$/);
+        if (m && method === "POST") {
+          const body = await readJSON(request);
+          const replyText = String(body.text || "").trim().slice(0, 1000);
+          if (!replyText) return error("متن پاسخ الزامی است");
+          const comment = await env.DB.prepare("SELECT id FROM comments WHERE id = ?").bind(m[1]).first();
+          if (!comment) return error("این نظر پیدا نشد", 404);
+          const now = new Date().toISOString();
+          const result = await env.DB.prepare(
+            "INSERT INTO comment_replies (comment_id, text, admin_role, created_at) VALUES (?, ?, ?, ?)"
+          ).bind(m[1], replyText, adminRole, now).run();
+          await logAdminActivity(env, adminRole, "پاسخ به نظر", `پاسخ به نظر ${m[1]} ثبت شد.`);
+          return json({ ok: true, id: result.meta.last_row_id, created_at: now });
         }
 
         m = path.match(/^\/api\/admin\/comments\/(\d+)$/);
         if (m && method === "DELETE") {
+          await env.DB.prepare("DELETE FROM comment_replies WHERE comment_id = ?").bind(m[1]).run();
           await env.DB.prepare("DELETE FROM comments WHERE id = ?").bind(m[1]).run();
           await logAdminActivity(env, adminRole, "حذف نظر", `نظر ${m[1]} حذف شد.`);
           return json({ ok: true });
