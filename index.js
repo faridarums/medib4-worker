@@ -258,6 +258,19 @@ async function ensureFeatureTables(env) {
     env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_comment_replies_comment_id ON comment_replies(comment_id, id)`)
   ]);
   try { await env.DB.prepare("ALTER TABLE webauthn_challenges ADD COLUMN origin TEXT").run(); } catch {}
+  // Semester management. Existing courses are automatically placed in semester 2.
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS semesters (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0
+  )`).run();
+  try { await env.DB.prepare("ALTER TABLE courses ADD COLUMN term_id TEXT").run(); } catch {}
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO semesters (id, title, sort_order) VALUES ('term_2', 'ترم ۲', 1)"
+  ).run();
+  await env.DB.prepare(
+    "UPDATE courses SET term_id = 'term_2' WHERE term_id IS NULL OR term_id = ''"
+  ).run();
 }
 
 async function logAdminActivity(env, role, action, details = "") {
@@ -271,8 +284,9 @@ async function logAdminActivity(env, role, action, details = "") {
 }
 
 async function performBackup(env) {
-  const [courses, questions, users, comments, messages, announcements, adminActivity] = await Promise.all([
-    env.DB.prepare("SELECT id, title, icon, sort_order FROM courses ORDER BY sort_order").all(),
+  const [terms, courses, questions, users, comments, messages, announcements, adminActivity] = await Promise.all([
+    env.DB.prepare("SELECT id, title, sort_order FROM semesters ORDER BY sort_order").all(),
+    env.DB.prepare("SELECT id, title, icon, sort_order, term_id FROM courses ORDER BY sort_order").all(),
     env.DB.prepare(
       "SELECT id, course_id, question, options, answer, explanation, sort_order, gender FROM questions ORDER BY course_id, sort_order"
     ).all(),
@@ -286,6 +300,7 @@ async function performBackup(env) {
   ]);
   const snapshot = {
     backup_date: new Date().toISOString(),
+    terms: terms.results,
     courses: courses.results,
     questions: questions.results,
     users: users.results,
@@ -325,9 +340,16 @@ export default {
     try {
       await ensureFeatureTables(env);
       // ============ PUBLIC: COURSES ============
+      if (path === "/api/terms" && method === "GET") {
+        const { results } = await env.DB.prepare(
+          "SELECT id, title, sort_order FROM semesters ORDER BY sort_order ASC"
+        ).all();
+        return json(results);
+      }
+
       if (path === "/api/courses" && method === "GET") {
         const { results } = await env.DB.prepare(
-          "SELECT id, title, icon FROM courses ORDER BY sort_order ASC"
+          "SELECT id, title, icon, term_id FROM courses ORDER BY sort_order ASC"
         ).all();
         return json(results);
       }
@@ -1009,10 +1031,56 @@ export default {
           return json({ ok: true, key });
         }
 
+        // ---- ADMIN: SEMESTERS ----
+        if (path === "/api/admin/terms" && method === "GET") {
+          const { results } = await env.DB.prepare(
+            "SELECT id, title, sort_order FROM semesters ORDER BY sort_order ASC"
+          ).all();
+          return json(results);
+        }
+
+        if (path === "/api/admin/terms" && method === "POST") {
+          const b = await readJSON(request);
+          const title = String(b.title || "").trim().slice(0, 100);
+          if (!title) return error("عنوان ترم الزامی است");
+          const id = String(b.id || ("term_" + Date.now().toString(36))).trim().slice(0, 80);
+          const maxRow = await env.DB.prepare(
+            "SELECT COALESCE(MAX(sort_order), 0) as m FROM semesters"
+          ).first();
+          await env.DB.prepare(
+            "INSERT INTO semesters (id, title, sort_order) VALUES (?, ?, ?)"
+          ).bind(id, title, Number(maxRow.m || 0) + 1).run();
+          await logAdminActivity(env, adminRole, "افزودن ترم", `ترم «${title}» ایجاد شد.`);
+          return json({ ok: true, id });
+        }
+
+        m = path.match(/^\/api\/admin\/terms\/([^/]+)$/);
+        if (m && method === "PUT") {
+          const b = await readJSON(request);
+          const title = String(b.title || "").trim().slice(0, 100);
+          if (!title) return error("عنوان ترم الزامی است");
+          await env.DB.prepare("UPDATE semesters SET title = ? WHERE id = ?")
+            .bind(title, decodeURIComponent(m[1])).run();
+          await logAdminActivity(env, adminRole, "ویرایش ترم", `ترم ${decodeURIComponent(m[1])} به «${title}» تغییر کرد.`);
+          return json({ ok: true });
+        }
+
+        if (m && method === "DELETE") {
+          const termId = decodeURIComponent(m[1]);
+          const countRow = await env.DB.prepare("SELECT COUNT(*) as count FROM courses WHERE term_id = ?").bind(termId).first();
+          if (Number(countRow?.count || 0) > 0) {
+            return error("این ترم هنوز درس دارد؛ اول درس‌های آن را حذف یا جابه‌جا کنید.", 409);
+          }
+          if (termId === "term_2") return error("ترم ۲ پیش‌فرض را نمی‌توان حذف کرد.", 409);
+          await env.DB.prepare("DELETE FROM semesters WHERE id = ?").bind(termId).run();
+          await logAdminActivity(env, adminRole, "حذف ترم", `ترم ${termId} حذف شد.`);
+          return json({ ok: true });
+        }
+
         // ---- ADMIN: COURSES ----
         if (path === "/api/admin/courses" && method === "GET") {
           const { results } = await env.DB.prepare(
-            "SELECT * FROM courses ORDER BY sort_order ASC"
+            "SELECT * FROM courses ORDER BY term_id, sort_order ASC"
           ).all();
           return json(results);
         }
@@ -1020,23 +1088,29 @@ export default {
         if (path === "/api/admin/courses" && method === "POST") {
           const b = await readJSON(request);
           if (!b.id || !b.title) return error("id و title الزامی هستند");
+          const termId = String(b.term_id || "term_2");
+          const term = await env.DB.prepare("SELECT id FROM semesters WHERE id = ?").bind(termId).first();
+          if (!term) return error("ترم انتخاب‌شده پیدا نشد", 404);
           const maxRow = await env.DB.prepare(
-            "SELECT COALESCE(MAX(sort_order), -1) as m FROM courses"
-          ).first();
+            "SELECT COALESCE(MAX(sort_order), -1) as m FROM courses WHERE term_id = ?"
+          ).bind(termId).first();
           await env.DB.prepare(
-            "INSERT INTO courses (id, title, icon, sort_order) VALUES (?, ?, ?, ?)"
+            "INSERT INTO courses (id, title, icon, sort_order, term_id) VALUES (?, ?, ?, ?, ?)"
           )
-            .bind(b.id, b.title, b.icon || "book-open", maxRow.m + 1)
+            .bind(b.id, b.title, b.icon || "book-open", maxRow.m + 1, termId)
             .run();
-          await logAdminActivity(env, adminRole, "افزودن درس", `درس «${b.title}» ایجاد شد.`);
+          await logAdminActivity(env, adminRole, "افزودن درس", `درس «${b.title}» در ${termId} ایجاد شد.`);
           return json({ ok: true });
         }
 
         m = path.match(/^\/api\/admin\/courses\/([^/]+)$/);
         if (m && method === "PUT") {
           const b = await readJSON(request);
-          await env.DB.prepare("UPDATE courses SET title = ?, icon = ? WHERE id = ?")
-            .bind(b.title, b.icon || "book-open", m[1])
+          const termId = String(b.term_id || "term_2");
+          const term = await env.DB.prepare("SELECT id FROM semesters WHERE id = ?").bind(termId).first();
+          if (!term) return error("ترم انتخاب‌شده پیدا نشد", 404);
+          await env.DB.prepare("UPDATE courses SET title = ?, icon = ?, term_id = ? WHERE id = ?")
+            .bind(b.title, b.icon || "book-open", termId, m[1])
             .run();
           await logAdminActivity(env, adminRole, "ویرایش درس", `درس ${m[1]} به «${b.title}» تغییر کرد.`);
           return json({ ok: true });
